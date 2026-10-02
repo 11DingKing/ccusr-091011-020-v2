@@ -155,6 +155,75 @@ class StockIn(models.Model):
         return f"{self.goods.name} - {self.quantity}"
 
 
+class StockInCorrection(models.Model):
+    """入库记录更正单（追加式，永不物理删除或改写）"""
+    STATUS_CHOICES = [
+        ('pending', '待审批'),
+        ('effective', '已生效'),
+        ('rejected', '已拒绝'),
+        ('withdrawn', '已撤回'),
+    ]
+
+    stock_in = models.ForeignKey(
+        StockIn, on_delete=models.PROTECT,
+        related_name='corrections', verbose_name='入库记录'
+    )
+    sequence = models.PositiveIntegerField('链内序号')
+    reason = models.TextField('更正理由')
+    status = models.CharField('状态', max_length=20, choices=STATUS_CHOICES, default='pending')
+    proposed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True,
+        related_name='proposed_stock_in_corrections', verbose_name='提交人'
+    )
+    approved_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='approved_stock_in_corrections', verbose_name='批准人'
+    )
+    approver_remark = models.TextField('审批意见', blank=True)
+    reverses = models.OneToOneField(
+        'self', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reversed_by', verbose_name='撤销的目标更正'
+    )
+    is_post_reference = models.BooleanField('是否事后更正（记录已被后续业务引用）', default=False)
+    created_at = models.DateTimeField('提交时间', auto_now_add=True)
+    approved_at = models.DateTimeField('生效时间', null=True, blank=True)
+
+    class Meta:
+        db_table = 'wh_stock_in_correction'
+        verbose_name = '入库更正单'
+        verbose_name_plural = verbose_name
+        ordering = ['stock_in', 'sequence']
+        unique_together = ['stock_in', 'sequence']
+
+    def __str__(self):
+        return f"更正单 #{self.sequence} - 入库记录 {self.stock_in_id} - {self.get_status_display()}"
+
+
+class StockInCorrectionItem(models.Model):
+    """更正明细：单个敏感字段的原值与建议值"""
+    FIELD_CHOICES = [
+        ('batch_no', '批次号'),
+        ('quantity', '入库数量'),
+    ]
+
+    correction = models.ForeignKey(
+        StockInCorrection, on_delete=models.CASCADE,
+        related_name='items', verbose_name='更正单'
+    )
+    field_name = models.CharField('字段', max_length=20, choices=FIELD_CHOICES)
+    old_value = models.CharField('原值', max_length=64)
+    new_value = models.CharField('建议值', max_length=64)
+
+    class Meta:
+        db_table = 'wh_stock_in_correction_item'
+        verbose_name = '入库更正明细'
+        verbose_name_plural = verbose_name
+        unique_together = ['correction', 'field_name']
+
+    def __str__(self):
+        return f"{self.get_field_name_display()}: {self.old_value} -> {self.new_value}"
+
+
 class StockOut(models.Model):
     """出库记录模型"""
     STATUS_CHOICES = [

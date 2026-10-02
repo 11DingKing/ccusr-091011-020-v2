@@ -12,7 +12,7 @@ from rest_framework.permissions import IsAuthenticated
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from apps.core.response import success_response, error_response
-from apps.warehouse.models import Goods, StockIn, StockOut, Warning
+from apps.warehouse.models import Goods, StockIn, StockOut, Warning, StockInCorrectionItem
 from .models import DailyReport
 
 logger = logging.getLogger('apps')
@@ -191,7 +191,9 @@ class ExportView(APIView):
                 cell.border = thin_border
             
             # 数据
-            goods_list = Goods.objects.select_related('variety', 'variety__category', 'unit').filter(is_active=True)
+            goods_list = Goods.objects.select_related(
+                'variety', 'variety__category', 'variety__category__unit'
+            ).filter(is_active=True)
             for goods in goods_list:
                 ws.append([
                     goods.code,
@@ -200,7 +202,7 @@ class ExportView(APIView):
                     goods.variety.name if goods.variety else '',
                     goods.specification,
                     float(goods.quantity),
-                    goods.unit.name if goods.unit else '',
+                    goods.variety.category.unit.name if goods.variety else '',
                     goods.location,
                     float(goods.warning_threshold)
                 ])
@@ -209,31 +211,82 @@ class ExportView(APIView):
             
         elif export_type == 'stock_in':
             ws.title = '入库记录'
-            headers = ['货物编码', '货物名称', '入库数量', '单位', '批次号', '供应商', '操作人', '入库时间']
+            headers = ['货物编码', '货物名称', '入库数量', '单位', '批次号', '供应商', '操作人', '入库时间', '更正次数']
             ws.append(headers)
-            
+
             for col in range(1, len(headers) + 1):
                 cell = ws.cell(row=1, column=col)
                 cell.font = header_font
                 cell.fill = header_fill
                 cell.alignment = header_alignment
                 cell.border = thin_border
-            
-            stock_ins = StockIn.objects.select_related('goods', 'goods__unit', 'operator').all()
+
+            stock_ins = StockIn.objects.select_related(
+                'goods', 'goods__variety__category__unit', 'operator'
+            ).annotate(
+                correction_count=Count('corrections')
+            ).all()
             for record in stock_ins:
                 ws.append([
                     record.goods.code,
                     record.goods.name,
                     float(record.quantity),
-                    record.goods.unit.name if record.goods.unit else '',
+                    record.goods.variety.category.unit.name if record.goods.variety else '',
                     record.batch_no,
                     record.supplier,
                     record.operator.username if record.operator else '',
-                    record.stock_in_time.strftime('%Y-%m-%d %H:%M:%S')
+                    record.stock_in_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    record.correction_count
                 ])
-            
+
             filename = f'入库记录_{datetime.now().strftime("%Y%m%d%H%M%S")}.xlsx'
-            
+
+        elif export_type == 'stock_in_correction':
+            # 入库更正链导出：解释主记录当前值与历史值之间的全部差异
+            ws.title = '入库更正记录'
+            headers = [
+                '更正单号', '入库记录ID', '货物编码', '货物名称', '字段',
+                '原值', '建议值', '状态', '更正理由', '提交人', '批准人',
+                '提交时间', '生效时间', '事后更正', '撤销目标更正单号'
+            ]
+            ws.append(headers)
+
+            for col in range(1, len(headers) + 1):
+                cell = ws.cell(row=1, column=col)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = thin_border
+
+            items = StockInCorrectionItem.objects.select_related(
+                'correction',
+                'correction__stock_in',
+                'correction__stock_in__goods',
+                'correction__proposed_by',
+                'correction__approved_by',
+            ).order_by('correction__stock_in_id', 'correction__sequence')
+            for item in items:
+                correction = item.correction
+                ws.append([
+                    correction.id,
+                    correction.stock_in_id,
+                    correction.stock_in.goods.code,
+                    correction.stock_in.goods.name,
+                    item.get_field_name_display(),
+                    item.old_value,
+                    item.new_value,
+                    correction.get_status_display(),
+                    correction.reason,
+                    correction.proposed_by.username if correction.proposed_by else '',
+                    correction.approved_by.username if correction.approved_by else '',
+                    correction.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                    correction.approved_at.strftime('%Y-%m-%d %H:%M:%S') if correction.approved_at else '',
+                    '是' if correction.is_post_reference else '否',
+                    correction.reverses_id or ''
+                ])
+
+            filename = f'入库更正记录_{datetime.now().strftime("%Y%m%d%H%M%S")}.xlsx'
+    
         elif export_type == 'stock_out':
             ws.title = '出库记录'
             headers = ['货物编码', '货物名称', '出库数量', '单位', '领用人', '领用部门', '状态', '操作人', '出库时间']
@@ -246,13 +299,15 @@ class ExportView(APIView):
                 cell.alignment = header_alignment
                 cell.border = thin_border
             
-            stock_outs = StockOut.objects.select_related('goods', 'goods__unit', 'operator').all()
+            stock_outs = StockOut.objects.select_related(
+                'goods', 'goods__variety__category__unit', 'operator'
+            ).all()
             for record in stock_outs:
                 ws.append([
                     record.goods.code,
                     record.goods.name,
                     float(record.quantity),
-                    record.goods.unit.name if record.goods.unit else '',
+                    record.goods.variety.category.unit.name if record.goods.variety else '',
                     record.receiver,
                     record.receiver_dept,
                     record.get_status_display(),
