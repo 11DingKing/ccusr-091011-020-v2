@@ -8,6 +8,8 @@ from .views import (
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
     DashboardView, GoodsListView, StockInListView, StockOutListView,
+    StockInCorrectionListView, StockInCorrectionApproveView,
+    StockInCorrectionRejectView, StockInCorrectionReverseView,
     WarningListView, ApprovalListView
 )
 
@@ -39,6 +41,10 @@ urlpatterns = [
     
     # 入库管理
     path('stock-in/', StockInListView.as_view(), name='stock-in-list'),
+    path('stock-in/<int:stock_in_pk>/corrections/', StockInCorrectionListView.as_view(), name='stock-in-corrections'),
+    path('corrections/<int:correction_pk>/approve/', StockInCorrectionApproveView.as_view(), name='correction-approve'),
+    path('corrections/<int:correction_pk>/reject/', StockInCorrectionRejectView.as_view(), name='correction-reject'),
+    path('corrections/<int:correction_pk>/reverse-proposal/', StockInCorrectionReverseView.as_view(), name='correction-reverse-proposal'),
     
     # 出库管理
     path('stock-out/', StockOutListView.as_view(), name='stock-out-list'),

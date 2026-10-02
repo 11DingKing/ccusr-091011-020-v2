@@ -2,7 +2,7 @@
 仓库管理序列化器
 """
 from rest_framework import serializers
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval, StockInCorrection
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -152,13 +152,70 @@ class StockInSerializer(serializers.ModelSerializer):
     """入库记录序列化器"""
     goods_name = serializers.CharField(source='goods.name', read_only=True)
     operator_name = serializers.CharField(source='operator.username', read_only=True)
-    
+    has_correction = serializers.SerializerMethodField()
+    correction_count = serializers.SerializerMethodField()
+
     class Meta:
         model = StockIn
         fields = [
             'id', 'goods', 'goods_name', 'operator', 'operator_name',
-            'quantity', 'batch_no', 'supplier', 'stock_in_time', 'remark'
+            'quantity', 'batch_no', 'supplier', 'stock_in_time', 'remark',
+            'initial_quantity', 'initial_batch_no',
+            'has_correction', 'correction_count',
         ]
+
+    def get_has_correction(self, obj):
+        return getattr(obj, 'has_effective_correction', None) is True
+
+    def get_correction_count(self, obj):
+        return getattr(obj, 'correction_total', None) or 0
+
+
+class CorrectionSerializer(serializers.ModelSerializer):
+    """更正分录序列化器"""
+    field_label = serializers.CharField(read_only=True)
+    kind_display = serializers.CharField(source='get_kind_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    proposed_by_name = serializers.CharField(source='proposed_by.username', read_only=True)
+    approved_by_name = serializers.CharField(source='approved_by.username', read_only=True)
+    target_seq = serializers.SerializerMethodField()
+    downstream_list = serializers.SerializerMethodField()
+
+    class Meta:
+        model = StockInCorrection
+        fields = [
+            'id', 'stock_in', 'seq', 'field_name', 'field_label',
+            'kind', 'kind_display', 'old_value', 'new_value', 'reason',
+            'status', 'status_display', 'reject_reason',
+            'proposed_by', 'proposed_by_name', 'proposed_at',
+            'approved_by', 'approved_by_name', 'approved_at',
+            'target', 'target_seq', 'reversed_by',
+            'downstream_refs', 'downstream_list',
+        ]
+
+    def get_target_seq(self, obj):
+        return obj.target.seq if obj.target_id else None
+
+    def get_downstream_list(self, obj):
+        import json
+        if not obj.downstream_refs:
+            return []
+        try:
+            return json.loads(obj.downstream_refs)
+        except (ValueError, TypeError):
+            return []
+
+
+class CorrectionProposeSerializer(serializers.Serializer):
+    """提议更正入参"""
+    field_name = serializers.ChoiceField(choices=['quantity', 'batch_no'])
+    new_value = serializers.CharField(required=True, allow_blank=True)
+    reason = serializers.CharField(required=True, min_length=1, max_length=500)
+
+
+class CorrectionRejectSerializer(serializers.Serializer):
+    """拒绝更正入参"""
+    reject_reason = serializers.CharField(required=True, min_length=1, max_length=500)
 
 
 class StockOutSerializer(serializers.ModelSerializer):

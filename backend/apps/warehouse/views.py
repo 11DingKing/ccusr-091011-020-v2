@@ -3,6 +3,10 @@
 """
 import logging
 import io
+from collections import defaultdict
+from decimal import Decimal
+from django.db import transaction
+from django.db.models import F
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -10,13 +14,16 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from apps.core.exceptions import BusinessException
+from . import corrections as correction_service
+from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval, StockInCorrection
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    CorrectionSerializer, CorrectionProposeSerializer, CorrectionRejectSerializer,
 )
 
 logger = logging.getLogger('apps')
@@ -587,16 +594,188 @@ class GoodsListView(APIView):
 
 
 class StockInListView(APIView):
-    """入库记录列表视图"""
+    """
+    入库记录列表视图
+
+    默认返回最新状态（quantity/batch_no 已叠加全部生效更正）；
+    传入 as_of=YYYY-MM-DD[THH:MM:SS] 时按更正生效时间重建该时点旧视图。
+    """
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        goods_id = request.query_params.get('goods_id')
+
+        moment = correction_service.parse_moment(request.query_params.get('as_of'))
+
+        queryset = StockIn.objects.select_related('goods', 'operator').all()
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        if moment is not None:
+            # 时间点视图只包含该时刻之前已登记的记录
+            queryset = queryset.filter(stock_in_time__lte=moment)
+        queryset = queryset.order_by('-stock_in_time', '-id')
+
+        total = queryset.count()
+        records = list(queryset[(page - 1) * page_size:page * page_size])
+
+        # 预取更正链，批量重建，避免 N+1
+        all_entries = StockInCorrection.objects.filter(
+            stock_in_id__in=[r.id for r in records], status='effective'
+        ).order_by('seq')
+        grouped = defaultdict(list)
+        for entry in all_entries:
+            grouped[entry.stock_in_id].append(entry)
+
+        for record in records:
+            chain = grouped.get(record.id, [])
+            if moment is None:
+                visible_chain = chain
+            else:
+                reversed_ids = {
+                    e.target_id for e in chain
+                    if e.kind == 'reversal' and e.approved_at <= moment
+                }
+                visible_chain = [
+                    e for e in chain
+                    if e.approved_at <= moment
+                    and not (e.kind == 'reversal' or e.id in reversed_ids)
+                ]
+            rebuilt = correction_service.apply_entries(
+                record.initial_quantity, record.initial_batch_no, chain, moment,
+            )
+            record.quantity = rebuilt['quantity']
+            record.batch_no = rebuilt['batch_no']
+            record.correction_total = len(visible_chain)
+            record.has_effective_correction = bool(visible_chain)
+
+        serializer = StockInSerializer(records, many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size,
+            'as_of': request.query_params.get('as_of') if moment else None,
         })
+
+    def post(self, request):
+        """登记入库记录（初始登记，不经更正链）。"""
+        goods_id = request.data.get('goods')
+        quantity = request.data.get('quantity')
+        try:
+            goods = Goods.objects.get(pk=goods_id)
+        except (Goods.DoesNotExist, ValueError, TypeError):
+            return error_response(message='货物不存在', code=404)
+        encoded_qty = correction_service.validate_new_value('quantity', quantity)
+
+        with transaction.atomic():
+            goods = Goods.objects.select_for_update().get(pk=goods.id)
+            stock_in = StockIn.objects.create(
+                goods=goods,
+                operator=request.user,
+                quantity=encoded_qty,
+                batch_no=(request.data.get('batch_no') or '').strip()[:50],
+                supplier=(request.data.get('supplier') or '').strip()[:200],
+                remark=(request.data.get('remark') or '').strip(),
+            )
+            # 登记即增加库存；与记录写入同一事务
+            goods.quantity = F('quantity') + Decimal(encoded_qty)
+            goods.save(update_fields=['quantity'])
+
+        logger.info(f"User {request.user.username} created stock-in {stock_in.id}")
+        stock_in = StockIn.objects.select_related('goods', 'operator').get(pk=stock_in.id)
+        stock_in.correction_total = 0
+        stock_in.has_effective_correction = False
+        return success_response(data=StockInSerializer(stock_in).data, message='登记成功')
+
+
+class StockInCorrectionListView(APIView):
+    """入库记录的更正分录链"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, stock_in_pk):
+        if not StockIn.objects.filter(pk=stock_in_pk).exists():
+            return error_response(message='入库记录不存在', code=404)
+        entries = StockInCorrection.objects.filter(
+            stock_in_id=stock_in_pk
+        ).select_related('proposed_by', 'approved_by', 'target').order_by('seq')
+        return success_response(data=CorrectionSerializer(entries, many=True).data)
+
+    def post(self, request, stock_in_pk):
+        """提议一笔更正（连续更正/挂起冲突在服务层校验）。"""
+        serializer = CorrectionProposeSerializer(data=request.data)
+        if not serializer.is_valid():
+            first = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first))
+        try:
+            entry = correction_service.propose_correction(
+                stock_in_pk,
+                serializer.validated_data['field_name'],
+                serializer.validated_data['new_value'],
+                serializer.validated_data['reason'],
+                request.user,
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info(
+            f"User {request.user.username} proposed correction {entry.id} "
+            f"on stock-in {stock_in_pk}"
+        )
+        return success_response(data=CorrectionSerializer(entry).data, message='更正申请已提交，等待批准')
+
+
+class StockInCorrectionApproveView(APIView):
+    """批准更正分录并生效"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, correction_pk):
+        try:
+            entry = correction_service.approve_correction(correction_pk, request.user)
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info(
+            f"User {request.user.username} approved correction {correction_pk}"
+        )
+        return success_response(data=CorrectionSerializer(entry).data, message='更正已生效')
+
+
+class StockInCorrectionRejectView(APIView):
+    """拒绝更正分录"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, correction_pk):
+        serializer = CorrectionRejectSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message='请填写拒绝理由')
+        try:
+            entry = correction_service.reject_correction(
+                correction_pk, request.user,
+                serializer.validated_data['reject_reason'],
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info(
+            f"User {request.user.username} rejected correction {correction_pk}"
+        )
+        return success_response(data=CorrectionSerializer(entry).data, message='已拒绝更正')
+
+
+class StockInCorrectionReverseView(APIView):
+    """提议撤销一笔已生效的更正（撤销本身需再走一次批准）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, correction_pk):
+        reason = request.data.get('reason')
+        try:
+            entry = correction_service.propose_reversal(correction_pk, reason, request.user)
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info(
+            f"User {request.user.username} proposed reversal {entry.id} "
+            f"for correction {correction_pk}"
+        )
+        return success_response(data=CorrectionSerializer(entry).data, message='撤销申请已提交，等待批准')
 
 
 class StockOutListView(APIView):

@@ -120,6 +120,7 @@ class OperationLogMiddleware:
             '/api/auth/': '认证管理',
             '/api/goods/': '货物管理',
             '/api/stock-in/': '入库管理',
+            '/api/corrections/': '入库更正',
             '/api/stock-out/': '出库管理',
             '/api/units/': '单位管理',
             '/api/categories/': '品类管理',
